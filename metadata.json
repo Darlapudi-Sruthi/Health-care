@@ -1,0 +1,6 @@
+{
+  "name": "HealthGuide AI – Healthcare Information Navigator",
+  "description": "An AI-powered healthcare information and service navigation platform with RAG-backed medical guidance from WHO and official health agencies, healthcare facility finder, emergency directory, and multilingual support in English, Telugu, and Hindi.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
