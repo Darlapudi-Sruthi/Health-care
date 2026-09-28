@@ -2,14 +2,83 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { HEALTH_KNOWLEDGE_BASE, HealthKnowledgeEntry } from '../../src/data/knowledgeBase';
 import { SupportedLanguage } from '../../src/data/translations';
 
+const N8N_CHAT_WEBHOOK_URL =
+  process.env.N8N_WEBHOOK_URL ||
+  'https://sruthidarlapudi.app.n8n.cloud/webhook/43701e97-8523-4873-b40a-1ab5922fe94d/chat';
+
 const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
+  apiKey: process.env.GEMINI_API_KEY || 'unconfigured',
   httpOptions: {
     headers: {
       'User-Agent': 'aistudio-build',
     },
   },
 });
+
+async function queryN8nAgent(
+  question: string,
+  language: SupportedLanguage,
+  sessionId: string,
+  userProfile?: { ageGroup?: string; location?: string }
+): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const response = await fetch(N8N_CHAT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'sendMessage',
+        sessionId: sessionId || 'healthguide-default-session',
+        chatInput: question,
+        question,
+        language,
+        userProfile,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) return null;
+
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const data: any = await response.json();
+      if (typeof data === 'string') return data;
+      if (Array.isArray(data) && data.length > 0) {
+        const first = data[0];
+        return (
+          first?.output ||
+          first?.text ||
+          first?.response ||
+          first?.message ||
+          JSON.stringify(first)
+        );
+      }
+      if (data && typeof data === 'object') {
+        return (
+          data.output ||
+          data.text ||
+          data.response ||
+          data.message ||
+          data.answer ||
+          JSON.stringify(data)
+        );
+      }
+    } else {
+      const text = await response.text();
+      if (text && text.trim()) return text.trim();
+    }
+  } catch (err) {
+    console.warn('n8n webhook call warning:', err);
+  }
+  return null;
+}
 
 interface EmbeddedKnowledgeChunk {
   entry: HealthKnowledgeEntry;
@@ -139,10 +208,12 @@ export default async function handler(req: any, res: any) {
       question,
       language = 'en',
       userProfile,
+      sessionId = 'healthguide-web-session',
     }: {
       question?: string;
       language?: SupportedLanguage;
       userProfile?: { ageGroup?: string; location?: string };
+      sessionId?: string;
     } = req.body || {};
 
     if (!question || typeof question !== 'string' || !question.trim()) {
@@ -150,8 +221,14 @@ export default async function handler(req: any, res: any) {
     }
 
     const trimmedQuestion = question.trim();
-    const retrieval = await retrieveRelevantKnowledge(trimmedQuestion, 3);
+    const [n8nResponseText, retrieval] = await Promise.all([
+      queryN8nAgent(trimmedQuestion, language, sessionId, userProfile),
+      retrieveRelevantKnowledge(trimmedQuestion, 3),
+    ]);
+
     const topEntries = retrieval.topChunks;
+    const primaryChunk = topEntries[0]?.entry || HEALTH_KNOWLEDGE_BASE[0];
+    const localizedChunk = primaryChunk.content[language] || primaryChunk.content.en;
 
     const retrievedReferences = topEntries.flatMap((item) =>
       item.entry.references.map((ref) => ({
@@ -165,6 +242,44 @@ export default async function handler(req: any, res: any) {
         similarityScore: item.similarityScore,
       }))
     );
+
+    let parsedFromN8n: any = null;
+    if (n8nResponseText) {
+      try {
+        const cleaned = n8nResponseText
+          .replace(/^```json\s*/i, '')
+          .replace(/```\s*$/, '')
+          .trim();
+        if (cleaned.startsWith('{') && cleaned.endsWith('}')) {
+          const candidate = JSON.parse(cleaned);
+          if (candidate.summary && Array.isArray(candidate.whenToSeeDoctor)) {
+            parsedFromN8n = candidate;
+          }
+        }
+      } catch {
+        // Plain text from n8n
+      }
+    }
+
+    if (parsedFromN8n) {
+      return res.status(200).json({
+        answer: {
+          ...parsedFromN8n,
+          n8nAgentOutput: n8nResponseText,
+        },
+        ragMetadata: {
+          embeddingModel: retrieval.embeddingModel,
+          generationModel: 'n8n-ai-agent + gemini-3.8-flash',
+          n8nConnected: true,
+          retrievedCategories: topEntries.map((t) => ({
+            id: t.entry.id,
+            name: t.entry.content[language]?.categoryName || t.entry.content.en.categoryName,
+            similarityScore: t.similarityScore,
+          })),
+          sources: retrievedReferences.slice(0, 5),
+        },
+      });
+    }
 
     const ragContextBlock = topEntries
       .map((item, idx) => {
@@ -197,7 +312,13 @@ export default async function handler(req: any, res: any) {
         }.`
       : '';
 
-    const systemInstruction = `You are HealthGuide AI – Healthcare Information Navigator.
+    const n8nContext = n8nResponseText
+      ? `\nn8n AI Agent Response to Incorporate:\n"${n8nResponseText}"\n`
+      : '';
+
+    if (process.env.GEMINI_API_KEY) {
+      try {
+        const systemInstruction = `You are HealthGuide AI – Healthcare Information Navigator.
 Your strict mission is to help users navigate healthcare services and understand general, reliable health information grounded in the provided WHO, Ministry of Health & Family Welfare (MoHFW), ICMR, and UNICEF knowledge base.
 
 CRITICAL MEDICAL SAFETY RULES (NON-NEGOTIABLE):
@@ -207,61 +328,100 @@ CRITICAL MEDICAL SAFETY RULES (NON-NEGOTIABLE):
 4. ALWAYS explain concepts in simple, calm, reassuring, easy-to-understand language in the user's requested language: ${languageName}.
 5. ALWAYS clearly state when professional medical advice from a qualified doctor is needed.`;
 
-    const prompt = `User Question: "${trimmedQuestion}"
+        const prompt = `User Question: "${trimmedQuestion}"
 Target Response Language: ${languageName}
 ${profileContext}
-
+${n8nContext}
 Retrieved RAG Knowledge Base Context:
 ${ragContextBlock}
 
 Respond strictly in JSON matching the schema, with all user-facing text fields written in ${languageName}.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            intent: {
-              type: Type.STRING,
-              description:
-                'Must be one of: general_health_info, healthcare_facility, emergency_info, other_service',
+        const response = await ai.models.generateContent({
+          model: 'gemini-3.8-flash',
+          contents: prompt,
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                intent: { type: Type.STRING },
+                intentExplanation: { type: Type.STRING },
+                summary: { type: Type.STRING },
+                commonReasonsOrContext: { type: Type.ARRAY, items: { type: Type.STRING } },
+                generalGuidance: { type: Type.ARRAY, items: { type: Type.STRING } },
+                whenToSeeDoctor: { type: Type.ARRAY, items: { type: Type.STRING } },
+                disclaimer: { type: Type.STRING },
+                suggestedServiceType: { type: Type.STRING },
+                isEmergencyRedFlag: { type: Type.BOOLEAN },
+              },
+              required: [
+                'intent',
+                'intentExplanation',
+                'summary',
+                'commonReasonsOrContext',
+                'generalGuidance',
+                'whenToSeeDoctor',
+                'disclaimer',
+                'suggestedServiceType',
+                'isEmergencyRedFlag',
+              ],
             },
-            intentExplanation: { type: Type.STRING },
-            summary: { type: Type.STRING },
-            commonReasonsOrContext: { type: Type.ARRAY, items: { type: Type.STRING } },
-            generalGuidance: { type: Type.ARRAY, items: { type: Type.STRING } },
-            whenToSeeDoctor: { type: Type.ARRAY, items: { type: Type.STRING } },
-            disclaimer: { type: Type.STRING },
-            suggestedServiceType: { type: Type.STRING },
-            isEmergencyRedFlag: { type: Type.BOOLEAN },
           },
-          required: [
-            'intent',
-            'intentExplanation',
-            'summary',
-            'commonReasonsOrContext',
-            'generalGuidance',
-            'whenToSeeDoctor',
-            'disclaimer',
-            'suggestedServiceType',
-            'isEmergencyRedFlag',
-          ],
-        },
-      },
-    });
+        });
 
-    const rawText = response.text?.trim() || '{}';
-    const parsed = JSON.parse(rawText);
+        const rawText = response.text?.trim() || '{}';
+        const parsed = JSON.parse(rawText);
+
+        return res.status(200).json({
+          answer: {
+            ...parsed,
+            ...(n8nResponseText ? { n8nAgentOutput: n8nResponseText } : {}),
+          },
+          ragMetadata: {
+            embeddingModel: retrieval.embeddingModel,
+            generationModel: n8nResponseText
+              ? 'n8n-ai-agent + gemini-3.8-flash'
+              : 'gemini-3.8-flash',
+            n8nConnected: Boolean(n8nResponseText),
+            retrievedCategories: topEntries.map((t) => ({
+              id: t.entry.id,
+              name: t.entry.content[language]?.categoryName || t.entry.content.en.categoryName,
+              similarityScore: t.similarityScore,
+            })),
+            sources: retrievedReferences.slice(0, 5),
+          },
+        });
+      } catch (geminiErr) {
+        console.warn('Gemini synthesis fallback:', geminiErr);
+      }
+    }
+
+    const fallbackAnswer = {
+      intent: 'general_health_info',
+      intentExplanation: localizedChunk.headline,
+      summary: n8nResponseText || localizedChunk.summary,
+      commonReasonsOrContext: localizedChunk.keyFacts,
+      generalGuidance: localizedChunk.generalSelfCareAndPrevention,
+      whenToSeeDoctor: localizedChunk.whenToSeeDoctor,
+      disclaimer:
+        language === 'te'
+          ? 'ఇది సాధారణ అవగాహన సమాచారం మాత్రమే. ఇది వ్యాధి నిర్ధారణ లేదా మందుల సూచన కాదు. వ్యక్తిగత వైద్య సలహా కోసం డాక్టర్‌ను సంప్రదించండి.'
+          : language === 'hi'
+          ? 'यह केवल सामान्य शैक्षिक स्वास्थ्य जानकारी है। यह किसी बीमारी का निदान या दवा का परामर्श नहीं है। कृपया किसी योग्य डॉक्टर से सलाह लें।'
+          : 'General educational information only. This does not constitute a medical diagnosis or prescription. Please consult a qualified healthcare professional.',
+      suggestedServiceType: primaryChunk.recommendedServiceType,
+      isEmergencyRedFlag: false,
+      ...(n8nResponseText ? { n8nAgentOutput: n8nResponseText } : {}),
+    };
 
     return res.status(200).json({
-      answer: parsed,
+      answer: fallbackAnswer,
       ragMetadata: {
         embeddingModel: retrieval.embeddingModel,
-        generationModel: 'gemini-3.8-flash',
+        generationModel: n8nResponseText ? 'n8n-ai-agent' : 'rag-knowledge-base',
+        n8nConnected: Boolean(n8nResponseText),
         retrievedCategories: topEntries.map((t) => ({
           id: t.entry.id,
           name: t.entry.content[language]?.categoryName || t.entry.content.en.categoryName,
